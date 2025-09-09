@@ -35,6 +35,18 @@ where
     }
 }
 
+impl From<GroupKeyInstance> for u64 {
+    fn from(value: GroupKeyInstance) -> Self {
+        value.0
+    }
+}
+
+impl From<GroupKeyInstance> for usize {
+    fn from(value: GroupKeyInstance) -> Self {
+        value.0 as usize
+    }
+}
+
 /// Alias to the default key type used by [`crate::default_group_key!`].
 pub type DefaultKey = SourceLocKey;
 
