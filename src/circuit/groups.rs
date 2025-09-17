@@ -1,12 +1,17 @@
 //! Traits and structs related to groups of regions.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     hash::{DefaultHasher, Hasher as _},
     marker::PhantomData,
+    rc::Rc,
 };
 
-use crate::circuit::{Cell, Layouter};
+use crate::{
+    circuit::{Cell, Layouter},
+    plonk::Error,
+};
 use ff::Field;
 
 /// Marker trait that defines a key that uniquelly identifying a group.
@@ -81,34 +86,38 @@ impl GroupKey for SourceLocKey {}
 /// a [`Cell`] has in the group.
 #[derive(Debug, Clone)]
 pub struct RegionsGroup {
-    annotated_cells: HashMap<Cell, CellRole>,
+    cells: Vec<Cell>,
+    annotations: HashMap<Cell, CellRole>,
+    /// Shared with the Layouter for tracking if annotating is enabled or not.
+    enabled: Rc<RefCell<bool>>,
 }
 
 impl RegionsGroup {
-    fn new() -> Self {
+    fn new(enabled: Rc<RefCell<bool>>) -> Self {
         Self {
-            annotated_cells: Default::default(),
+            cells: Default::default(),
+            annotations: Default::default(),
+            enabled,
         }
     }
 
+    /// Returns a list of cells of the given role in the order of their annotation.
     fn cells_of_role(&self, role: CellRole) -> impl Iterator<Item = Cell> + '_ {
-        self.annotated_cells
-            .iter()
-            .filter_map(move |(cell, cell_role)| {
-                if *cell_role == role {
-                    Some(*cell)
-                } else {
-                    None
-                }
-            })
+        self.cells.iter().filter_map(move |cell| {
+            if self.annotations[cell] == role {
+                Some(*cell)
+            } else {
+                None
+            }
+        })
     }
 
-    /// Returns a list of [`Cell`] annotated as [`CellRole::Input`].
+    /// Returns a list of [`Cell`] annotated as [`CellRole::Input`] in the order of annotation.
     pub fn inputs(&self) -> impl Iterator<Item = Cell> + '_ {
         self.cells_of_role(CellRole::Input)
     }
 
-    /// Returns a list of [`Cell`] annotated as [`CellRole::Output`].
+    /// Returns a list of [`Cell`] annotated as [`CellRole::Output`] in the order of annotation.
     pub fn outputs(&self) -> impl Iterator<Item = Cell> + '_ {
         self.cells_of_role(CellRole::Output)
     }
@@ -120,8 +129,16 @@ impl RegionsGroup {
     /// annotated with a role must have transitive copy constrains to at least one
     /// cell from the regions of the group. This requirement is not enforced by this type.
     #[inline]
-    pub fn annotate_cell(&mut self, cell: Cell, role: CellRole) {
-        self.annotated_cells.insert(cell, role);
+    pub fn annotate_cell(&mut self, cell: Cell, role: CellRole) -> Result<(), Error> {
+        if !*self.enabled.borrow() {
+            return Ok(());
+        }
+        if self.annotations.contains_key(&cell) {
+            return Err(Error::Synthesis);
+        }
+        self.cells.push(cell);
+        self.annotations.insert(cell, role);
+        Ok(())
     }
 
     /// Annotates a [`Cell`] with a [`CellRole::Input`].
@@ -129,7 +146,7 @@ impl RegionsGroup {
     /// See the documentation in [`RegionsGroup::annotate_cell`] for requirements annotated cells must
     /// meet.
     #[inline]
-    pub fn annotate_input(&mut self, cell: Cell) {
+    pub fn annotate_input(&mut self, cell: Cell) -> Result<(), Error> {
         self.annotate_cell(cell, CellRole::Input)
     }
 
@@ -139,7 +156,7 @@ impl RegionsGroup {
     /// meet.
     /// cell from the regions of the group.
     #[inline]
-    pub fn annotate_output(&mut self, cell: Cell) {
+    pub fn annotate_output(&mut self, cell: Cell) -> Result<(), Error> {
         self.annotate_cell(cell, CellRole::Output)
     }
 
@@ -148,10 +165,11 @@ impl RegionsGroup {
     /// See the documentation in [`RegionsGroup::annotate_cell`] for requirements annotated cells must
     /// meet.
     #[inline]
-    pub fn annotate_inputs(&mut self, cells: impl IntoIterator<Item = Cell>) {
+    pub fn annotate_inputs(&mut self, cells: impl IntoIterator<Item = Cell>) -> Result<(), Error> {
         for cell in cells {
-            self.annotate_cell(cell, CellRole::Input);
+            self.annotate_cell(cell, CellRole::Input)?;
         }
+        Ok(())
     }
 
     /// Annotates a list of [`Cell`] with a [`CellRole::Output`].
@@ -160,10 +178,11 @@ impl RegionsGroup {
     /// meet.
     /// cell from the regions of the group.
     #[inline]
-    pub fn annotate_outputs(&mut self, cells: impl IntoIterator<Item = Cell>) {
+    pub fn annotate_outputs(&mut self, cells: impl IntoIterator<Item = Cell>) -> Result<(), Error> {
         for cell in cells {
-            self.annotate_cell(cell, CellRole::Output);
+            self.annotate_cell(cell, CellRole::Output)?;
         }
+        Ok(())
     }
 }
 
@@ -173,13 +192,16 @@ impl RegionsGroup {
 #[derive(Debug)]
 pub struct GroupLayouter<'l, F: Field, L: Layouter<F>> {
     parent: &'l mut L,
+    /// Shared with RegionGroup for tracking if annotating is enabled or not.
+    enabled: Rc<RefCell<bool>>,
     _marker: PhantomData<F>,
 }
 
 impl<'l, F: Field, L: Layouter<F>> GroupLayouter<'l, F, L> {
-    pub(super) fn new(parent: &'l mut L) -> Self {
+    pub(super) fn new(parent: &'l mut L, enabled: Rc<RefCell<bool>>) -> Self {
         Self {
             parent,
+            enabled,
             _marker: Default::default(),
         }
     }
@@ -191,23 +213,43 @@ impl<F: Field, L: Layouter<F>> Layouter<F> for GroupLayouter<'_, F, L> {
     fn assign_region<A, AR, N, NR>(
         &mut self,
         name: N,
-        assignment: A,
+        mut assignment: A,
     ) -> Result<AR, crate::plonk::Error>
     where
         A: FnMut(super::Region<'_, F>) -> Result<AR, crate::plonk::Error>,
         N: Fn() -> NR,
         NR: Into<String>,
     {
-        self.parent.assign_region(name, assignment)
+        let mut call_count = 0;
+        self.parent.assign_region(name, |region| {
+            // Enable annotating only the first time we call the closure.
+            *self.enabled.borrow_mut() = call_count == 0;
+            let r = assignment(region);
+            *self.enabled.borrow_mut() = true;
+            call_count += 1;
+            r
+        })
     }
 
-    fn assign_table<A, N, NR>(&mut self, name: N, assignment: A) -> Result<(), crate::plonk::Error>
+    fn assign_table<A, N, NR>(
+        &mut self,
+        name: N,
+        mut assignment: A,
+    ) -> Result<(), crate::plonk::Error>
     where
         A: FnMut(super::Table<'_, F>) -> Result<(), crate::plonk::Error>,
         N: Fn() -> NR,
         NR: Into<String>,
     {
-        self.parent.assign_table(name, assignment)
+        let mut call_count = 0;
+        self.parent.assign_table(name, |table| {
+            // Enable annotating only the first time we call the closure.
+            *self.enabled.borrow_mut() = call_count == 0;
+            let r = assignment(table);
+            *self.enabled.borrow_mut() = true;
+            call_count += 1;
+            r
+        })
     }
 
     fn constrain_instance(
@@ -261,17 +303,18 @@ pub(super) struct GroupScope<'l, F: Field, L: Layouter<F>> {
 
 impl<'l, F: Field, L: Layouter<F>> GroupScope<'l, F, L> {
     pub fn new(parent: &'l mut L) -> Self {
+        let enabled = Rc::new(RefCell::new(true));
         Self {
-            layouter: GroupLayouter::new(parent),
-            meta: RegionsGroup::new(),
+            layouter: GroupLayouter::new(parent, enabled.clone()),
+            meta: RegionsGroup::new(enabled),
         }
     }
 }
 
 impl<F: Field, L: Layouter<F>> Drop for GroupScope<'_, F, L> {
     fn drop(&mut self) {
-        self.layouter
-            .pop_group(std::mem::replace(&mut self.meta, RegionsGroup::new()))
+        let meta = std::mem::replace(&mut self.meta, RegionsGroup::new(Default::default()));
+        self.layouter.pop_group(meta)
     }
 }
 
@@ -418,7 +461,7 @@ mod tests {
                                 0,
                                 || Value::<F>::unknown(),
                             )?;
-                            group.annotate_input(input.cell());
+                            group.annotate_input(input.cell())?;
                             region.assign_advice(
                                 || "f",
                                 config.advices[0],
@@ -427,7 +470,7 @@ mod tests {
                             )
                         },
                     )?;
-                    group.annotate_output(o.cell());
+                    group.annotate_output(o.cell())?;
                     Ok(())
                 },
             )
@@ -467,7 +510,7 @@ mod tests {
                 || "one",
                 default_group_key!(),
                 |layouter, group| {
-                    group.annotate_inputs(ins.iter().map(|ac| ac.cell()));
+                    group.annotate_inputs(ins.iter().map(|ac| ac.cell()))?;
                     let o = layouter.assign_region(
                         || "region #1",
                         |mut region| {
@@ -494,7 +537,7 @@ mod tests {
                             )
                         },
                     )?;
-                    group.annotate_output(o.cell());
+                    group.annotate_output(o.cell())?;
                     Ok(())
                 },
             )
@@ -502,6 +545,73 @@ mod tests {
         r"(top-level 
             (groups (one
                 (inputs [R0[A1, 0], R0[A1, 1]])
+                (outputs [R1[A2, 0]])
+        )))"
+    );
+
+    circuit_test!(
+        one_level_outside_inputs_maintain_insertion_order,
+        SimpleFloorPlanner,
+        |config, layouter| {
+            // This test uses cells from an outside region to test that any cell can be
+            // annotated.
+            let ins = layouter.assign_region(
+                || "region #0",
+                |mut region| {
+                    let in0 = region.assign_advice(
+                        || "in0",
+                        config.advices[1],
+                        0,
+                        || Value::<F>::unknown(),
+                    )?;
+                    let in1 = region.assign_advice(
+                        || "in1",
+                        config.advices[1],
+                        1,
+                        || Value::<F>::unknown(),
+                    )?;
+                    Ok([in0, in1])
+                },
+            )?;
+            layouter.group(
+                || "one",
+                default_group_key!(),
+                |layouter, group| {
+                    group.annotate_inputs(ins.iter().rev().map(|ac| ac.cell()))?;
+                    let o = layouter.assign_region(
+                        || "region #1",
+                        |mut region| {
+                            let in0 = region.assign_advice(
+                                || "in0",
+                                config.advices[0],
+                                0,
+                                || ins[0].value().copied(),
+                            )?;
+                            let in1 = region.assign_advice(
+                                || "in1",
+                                config.advices[0],
+                                1,
+                                || ins[1].value().copied(),
+                            )?;
+                            region.constrain_equal(ins[0].cell(), in0.cell())?;
+                            region.constrain_equal(ins[1].cell(), in1.cell())?;
+
+                            region.assign_advice(
+                                || "sum",
+                                config.advices[2],
+                                0,
+                                || in0.value() + in1.value(),
+                            )
+                        },
+                    )?;
+                    group.annotate_output(o.cell())?;
+                    Ok(())
+                },
+            )
+        },
+        r"(top-level 
+            (groups (one
+                (inputs [R0[A1, 1], R0[A1, 0]])
                 (outputs [R1[A2, 0]])
         )))"
     );
@@ -570,13 +680,13 @@ mod tests {
                             |mut region| {
                                 let x =
                                     region.assign_advice(|| "x", x, 0, || Value::<F>::unknown())?;
-                                group.annotate_input(x.cell());
+                                group.annotate_input(x.cell())?;
                                 let y =
                                     region.assign_advice(|| "y", y, 0, || Value::<F>::unknown())?;
-                                group.annotate_input(y.cell());
+                                group.annotate_input(y.cell())?;
                                 let z =
                                     region.assign_advice(|| "z", z, 0, || x.value() * y.value())?;
-                                group.annotate_output(z.cell());
+                                group.annotate_output(z.cell())?;
                                 Ok(())
                             },
                         )
@@ -706,9 +816,7 @@ mod tests {
 
     #[inline]
     fn format_cell_list(cells: &[Cell]) -> Vec<CellDisplay> {
-        let mut v: Vec<_> = cells.iter().copied().map(CellDisplay).collect();
-        v.sort();
-        v
+        cells.iter().copied().map(CellDisplay).collect()
     }
 
     fn write_group(
